@@ -17,6 +17,7 @@ typedef struct {
     unsigned int seed;
     char *view_path;
     char *player_paths[MAX_PLAYERS];
+    int player_pipes[MAX_PLAYERS];
     int player_count;
     GameState *gs;
     size_t     state_size;
@@ -24,6 +25,11 @@ typedef struct {
 } master;
 
 static void parse_args(int argc, char *argv[], Master *m) {
+    // super imporatnte entender, aca el usuario pone en la consola y se pushean los argumentos cuando ponemos a correr el programa(tipo arqui)
+    if(m==NULL){
+        fprintf(stderr, "error: puntero nulo\n");
+        exit(EXIT_FAILURE);
+    }
     m->width        = DEFAULT_WIDTH;
     m->height       = DEFAULT_HEIGHT;
     m->delay_ms     = DEFAULT_DELAY;
@@ -66,24 +72,78 @@ static void parse_args(int argc, char *argv[], Master *m) {
     }
 }
 
-int initGameState(void){
+int initGame(master *m){
+
+    //INICIALIZO MEMORIA COMPARTIDA GAME SYNC
     int fdSync = shm_open("/game_sync", O_CREAT | O_RDWR, 0666); 
     //“quiero una shared memory llamada /game_state”
     //O_CREAT = si no existe, crearla
     //O_RDWR = la voy a leer y escribir
-    int stateSize = game_state_size(ver q le ponemos)
-    ftruncate(fdSync, stateSize); // asignarle size 
+    int sync_size = sizeof(m->sync) ////verrrr
+    ftruncate(fdSync, sync_size); // asignarle size q va a tener memoria compartida 
+    m->sync = mmap(NULL, sync_size, PROT_READ | PROT_WRITE, MAP_SHARED, fdSync, 0); // da permisos para leer y escribir en la memoria compartida y esta diciendo q otros procesos puedan acceder a ella y 0 es el offset
 
-    GameSync *gameSync = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fdSync, 0); // da permisos para leer y escribir en la memoria compartida y esta diciendo q otros procesos puedan acceder a ella y 0 es el offset
 
-    /////
+    //INICIALIZO MEMORIA COMPARTIDA GAME STATE
     int fdState = shm_open("/game_state", O_CREAT | O_RDWR, 0666); 
-   
-    ftruncate(fdState, size); // asignarle size 
+    m->state_size = game_state_size(m->width, m->height);
+    ftruncate(fdState, m->state_size);
+    m->gs = mmap(NULL, m->state_size, PROT_READ | PROT_WRITE, MAP_SHARED, fdState, 0);
+       
+}
+int main()
+{
+    Master m;
+    memset(&m, 0, sizeof(m));
+ 
+    parse_args(argc, argv, &m); //relleno mi master struct con los argumentos que me pasan por linea de comando
+ 
+    initGame(&m); //inicializamos las memorias compartidas
+    initSem(&m); //inicializamos los semaforos
+    initCanales(&m): //inicializamos los canales de comunicacion con los jugadores
 
-    GameState *gameState = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fdState, 0);
-    //    
 
+    return EXIT_SUCCESS;
+}
+
+void initCanales(Master *m){
+    //visto en clase
+    //int fd[2]
+    //pipe(fd) crea un par de descriptores de archivo conectados entre sí: fd[0] para lectura y fd[1] para escritura
+    int cantPlayers = m->player_count;
+    for (i = 0; i < cantPlayers; i++) {
+        pid = fork();
+
+        if (pid == 0) {
+            // hijo jugador i
+
+            // cerrar todo salvo player_pipes[i][1]
+            for (j = 0; j < cantPlayers; j++) {
+                if (j == i) {
+                    close(player_pipes[j][0]);   // no leo mi pipe
+                } else {
+                    close(player_pipes[j][0]);   // no uso pipe ajeno
+                    close(player_pipes[j][1]);   // no uso pipe ajeno
+                }
+            }
+
+            // me queda solo player_pipes[i][1]
+            // después vendrá dup2(...) y exec(...)
+        }
+    }
+
+    // master: cerrar todos los [1], quedarse con todos los [0]
+    for (i = 0; i < cantPlayers; i++) {
+        close(player_pipes[i][1]);
+    }
+        for(int i=0; i<m->player_count; i++){
+            if (pipe(m->player_pipes[i]) == -1) {
+                perror("pipe");
+                exit(EXIT_FAILURE);
+            }
+
+        }
+    }
 
 // /*/* ── helpers ─────────────────────────────────────────────────────────────── */
  
