@@ -18,6 +18,7 @@ typedef struct {
     char *view_path;
     char *player_paths[MAX_PLAYERS];
     int player_pipes[MAX_PLAYERS];
+    int view_pipe[2];
     int player_count;
     GameState *gs;
     size_t     state_size;
@@ -106,44 +107,67 @@ int main()
     return EXIT_SUCCESS;
 }
 
-void initCanales(Master *m){
-    //visto en clase
-    //int fd[2]
-    //pipe(fd) crea un par de descriptores de archivo conectados entre sí: fd[0] para lectura y fd[1] para escritura
+void initCanales(Master *m) {
     int cantPlayers = m->player_count;
-    for (i = 0; i < cantPlayers; i++) {
-        pid = fork();
+
+    // crear todos los pipes de los jugadores
+    for (int i = 0; i < cantPlayers; i++) {
+        if (pipe(m->player_pipes[i]) == -1) {
+            perror("pipe");
+            exit(EXIT_FAILURE);
+        }
+    }
+    //creo pipe de la vista
+    if (pipe(m->view_pipe) == -1) {
+            perror("pipe");
+            exit(EXIT_FAILURE);
+        }
+}
+void initProcesses(Master *m){
+    // crear hijos
+    for (int i = 0; i < cantPlayers; i++) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
 
         if (pid == 0) {
             // hijo jugador i
 
-            // cerrar todo salvo player_pipes[i][1]
-            for (j = 0; j < cantPlayers; j++) {
+            for (int j = 0; j < cantPlayers; j++) {
                 if (j == i) {
-                    close(player_pipes[j][0]);   // no leo mi pipe
+                    close(m->player_pipes[j][0]);   // cierro lectura de mi pipe
                 } else {
-                    close(player_pipes[j][0]);   // no uso pipe ajeno
-                    close(player_pipes[j][1]);   // no uso pipe ajeno
+                    close(m->player_pipes[j][0]);   // cierro pipe ajeno
+                    close(m->player_pipes[j][1]);
                 }
             }
 
-            // me queda solo player_pipes[i][1]
-            // después vendrá dup2(...) y exec(...)
+            dup2(m->player_pipes[i][1], STDOUT_FILENO);
+            close(m->player_pipes[i][1]);
+
+//misma onda que execl, el hijo se va a meter aca y va a ir a correr su programa, y ahora arranca el juego!
+            execl(m->player_paths[i], m->player_paths[i], NULL);
+            perror("execl");
+           exit(EXIT_FAILURE);
+
+            exit(0);
         }
+
+        /
     }
 
-    // master: cerrar todos los [1], quedarse con todos los [0]
-    for (i = 0; i < cantPlayers; i++) {
-        close(player_pipes[i][1]);
+    // 3) master: se queda solo con lecturas
+    for (int i = 0; i < cantPlayers; i++) {
+        close(m->player_pipes[i][1]);
     }
-        for(int i=0; i<m->player_count; i++){
-            if (pipe(m->player_pipes[i]) == -1) {
-                perror("pipe");
-                exit(EXIT_FAILURE);
-            }
+    close(m->view_pipe[0]);
+    dup2(m->view_pipe[1], STDOUT_FILENO);
+    close(m->view_pipe[1]);
+}
 
-        }
-    }
 
 // /*/* ── helpers ─────────────────────────────────────────────────────────────── */
  
