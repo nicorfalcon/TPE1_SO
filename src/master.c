@@ -1,6 +1,20 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <semaphore.h>
+#include <stdbool.h>
+
 #include "include/game_state.h"
 #include "include/game_sync.h"
-#include "include/protocol.h"
+
+/* ── constantes ──────────────────────────────────────────────────────────── */
 
 #define DEFAULT_WIDTH   10
 #define DEFAULT_HEIGHT  10
@@ -8,6 +22,8 @@
 #define DEFAULT_TIMEOUT 10
 #define MIN_WIDTH       10
 #define MIN_HEIGHT      10
+
+/* ── estructura interna del master ──────────────────────────────────────── */
 
 typedef struct {
     int width;
@@ -17,17 +33,32 @@ typedef struct {
     unsigned int seed;
     char *view_path;
     char *player_paths[MAX_PLAYERS];
-    int player_pipes[MAX_PLAYERS];
-    int view_pipe[2];
-    int player_count;
+    int   player_count;
+
+    /* pipes: player_pipes[i][0]=lectura(master), player_pipes[i][1]=escritura(jugador) */
+    int player_pipes[MAX_PLAYERS][2];
+
+    /* PIDs de los hijos */
+    pid_t player_pids[MAX_PLAYERS];
+    pid_t view_pid;
+
+    /* shared memory */
     GameState *gs;
     size_t     state_size;
     GameSync  *sync;
-} master;
+} Master;
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+
+static void die(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+/* ── parse_args ──────────────────────────────────────────────────────────── */
 
 static void parse_args(int argc, char *argv[], Master *m) {
-    // super imporatnte entender, aca el usuario pone en la consola y se pushean los argumentos cuando ponemos a correr el programa(tipo arqui)
-    if(m==NULL){
+    if (m == NULL) {
         fprintf(stderr, "error: puntero nulo\n");
         exit(EXIT_FAILURE);
     }
@@ -38,7 +69,7 @@ static void parse_args(int argc, char *argv[], Master *m) {
     m->seed         = (unsigned int)time(NULL);
     m->view_path    = NULL;
     m->player_count = 0;
- 
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
             m->width = atoi(argv[++i]);
@@ -64,7 +95,7 @@ static void parse_args(int argc, char *argv[], Master *m) {
             }
         }
     }
- 
+
     if (m->player_count == 0) {
         fprintf(stderr,
             "uso: master -p jugador1 [jugador2 ...] "
@@ -73,261 +104,188 @@ static void parse_args(int argc, char *argv[], Master *m) {
     }
 }
 
-int initGame(master *m){
+/* ── initGame: crea las dos shared memories ──────────────────────────────── */
 
-    //INICIALIZO MEMORIA COMPARTIDA GAME SYNC
-    int fdSync = shm_open("/game_sync", O_CREAT | O_RDWR, 0666); 
-    //“quiero una shared memory llamada /game_state”
-    //O_CREAT = si no existe, crearla
-    //O_RDWR = la voy a leer y escribir
-    int sync_size = sizeof(m->sync) ////verrrr
-    ftruncate(fdSync, sync_size); // asignarle size q va a tener memoria compartida 
-    m->sync = mmap(NULL, sync_size, PROT_READ | PROT_WRITE, MAP_SHARED, fdSync, 0); // da permisos para leer y escribir en la memoria compartida y esta diciendo q otros procesos puedan acceder a ella y 0 es el offset
+static void initGame(Master *m) {
+    /* ── /game_state ── */
+    m->state_size = game_state_size((unsigned short)m->width,
+                                    (unsigned short)m->height);
 
-
-    //INICIALIZO MEMORIA COMPARTIDA GAME STATE
-    int fdState = shm_open("/game_state", O_CREAT | O_RDWR, 0666); 
-    m->state_size = game_state_size(m->width, m->height);
-    ftruncate(fdState, m->state_size);
+    int fdState = shm_open(SHM_STATE_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fdState == -1) die("shm_open /game_state");
+    if (ftruncate(fdState, (off_t)m->state_size) == -1) die("ftruncate /game_state");
     m->gs = mmap(NULL, m->state_size, PROT_READ | PROT_WRITE, MAP_SHARED, fdState, 0);
-       
+    if (m->gs == MAP_FAILED) die("mmap /game_state");
+    close(fdState);
+
+    /* inicializar campos */
+    m->gs->width        = (unsigned short)m->width;
+    m->gs->height       = (unsigned short)m->height;
+    m->gs->player_count = (unsigned char)m->player_count;
+    m->gs->game_over    = false;
+
+    /* llenar tablero con recompensas aleatorias 1-9 */
+    srand(m->seed);
+    int total = m->width * m->height;
+    for (int i = 0; i < total; i++)
+        m->gs->board[i] = (char)(rand() % 9 + 1);
+
+    /* ── /game_sync ── */
+    int fdSync = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fdSync == -1) die("shm_open /game_sync");
+    if (ftruncate(fdSync, sizeof(GameSync)) == -1) die("ftruncate /game_sync");
+    m->sync = mmap(NULL, sizeof(GameSync), PROT_READ | PROT_WRITE, MAP_SHARED, fdSync, 0);
+    if (m->sync == MAP_FAILED) die("mmap /game_sync");
+    close(fdSync);
 }
-int main()
-{
-    Master m;
-    memset(&m, 0, sizeof(m));
- 
-    parse_args(argc, argv, &m); //relleno mi master struct con los argumentos que me pasan por linea de comando
- 
-    initGame(&m); //inicializamos las memorias compartidas
-    initSem(&m); //inicializamos los semaforos
-    initCanales(&m): //inicializamos los canales de comunicacion con los jugadores
 
+/* ── initSem: inicializa los semáforos ───────────────────────────────────── */
 
-    return EXIT_SUCCESS;
-}
+static void initSem(Master *m) {
+    GameSync *s = m->sync;
 
-void initCanales(Master *m) {
-    int cantPlayers = m->player_count;
+    /*
+     * sem_init(sem, pshared=1, valor)
+     * pshared=1 → compartido entre procesos (vive en shared memory)
+     *
+     * A y B en 0: señalización, arrancan bloqueados
+     * C, D, E en 1: mutex, arrancan libres
+     * G[i] en 0: cada jugador espera el primer ack del master
+     */
+    if (sem_init(&s->view_notify,   1, 0) == -1) die("sem_init view_notify");
+    if (sem_init(&s->view_done,     1, 0) == -1) die("sem_init view_done");
+    if (sem_init(&s->no_writer,     1, 1) == -1) die("sem_init no_writer");
+    if (sem_init(&s->state_mutex,   1, 1) == -1) die("sem_init state_mutex");
+    if (sem_init(&s->readers_mutex, 1, 1) == -1) die("sem_init readers_mutex");
+    s->readers_count = 0;
 
-    // crear todos los pipes de los jugadores
-    for (int i = 0; i < cantPlayers; i++) {
-        if (pipe(m->player_pipes[i]) == -1) {
-            perror("pipe");
-            exit(EXIT_FAILURE);
-        }
+    for (int i = 0; i < m->player_count; i++) {
+        if (sem_init(&s->player_ack[i], 1, 0) == -1) die("sem_init player_ack");
     }
-    //creo pipe de la vista
-    if (pipe(m->view_pipe) == -1) {
-            perror("pipe");
-            exit(EXIT_FAILURE);
-        }
 }
-void initProcesses(Master *m){
-    // crear hijos
-    for (int i = 0; i < cantPlayers; i++) {
-        pid_t pid = fork();
 
-        if (pid < 0) {
-            perror("fork");
-            exit(EXIT_FAILURE);
-        }
+/* ── initCanales: crea los pipes de los jugadores ───────────────────────── */
+
+static void initCanales(Master *m) {
+    for (int i = 0; i < m->player_count; i++) {
+        if (pipe(m->player_pipes[i]) == -1) die("pipe");
+    }
+}
+
+/* ── initProcesses: fork de vista y jugadores ────────────────────────────
+ *
+ * Para cada jugador:
+ *   1. fork()
+ *   2. hijo: cierra todos los pipes que no le pertenecen,
+ *            redirige su extremo de escritura a stdout (fd 1),
+ *            ejecuta el binario del jugador con execlp
+ *   3. padre: guarda el pid, cierra el extremo de escritura
+ *             (el master solo lee)
+ *
+ * Para la vista:
+ *   1. fork()
+ *   2. hijo: ejecuta el binario de la vista pasando width y height
+ *   3. padre: guarda el pid
+ *
+ * La vista NO usa pipes — se comunica solo por shared memory + semáforos A/B.
+ */
+static void initProcesses(Master *m) {
+    char w[16], h[16];
+    snprintf(w, sizeof(w), "%d", m->width);
+    snprintf(h, sizeof(h), "%d", m->height);
+
+    /* ── fork jugadores ── */
+    for (int i = 0; i < m->player_count; i++) {
+        pid_t pid = fork();
+        if (pid < 0) die("fork jugador");
 
         if (pid == 0) {
-            // hijo jugador i
-
-            for (int j = 0; j < cantPlayers; j++) {
+            /* hijo: cerrar todos los pipes que no son el mío */
+            for (int j = 0; j < m->player_count; j++) {
                 if (j == i) {
-                    close(m->player_pipes[j][0]);   // cierro lectura de mi pipe
+                    /* mi pipe: cierro el extremo de lectura (lo usa el master) */
+                    close(m->player_pipes[j][0]);
                 } else {
-                    close(m->player_pipes[j][0]);   // cierro pipe ajeno
+                    /* pipe ajeno: cierro ambos extremos */
+                    close(m->player_pipes[j][0]);
                     close(m->player_pipes[j][1]);
                 }
             }
 
-            dup2(m->player_pipes[i][1], STDOUT_FILENO);
+            /* redirigir escritura a stdout para que el master pueda leer */
+            if (dup2(m->player_pipes[i][1], STDOUT_FILENO) == -1) die("dup2");
             close(m->player_pipes[i][1]);
 
-//misma onda que execl, el hijo se va a meter aca y va a ir a correr su programa, y ahora arranca el juego!
-            execl(m->player_paths[i], m->player_paths[i], NULL);
-            perror("execl");
-           exit(EXIT_FAILURE);
-
-            exit(0);
+            /* ejecutar el jugador pasando width y height */
+            execlp(m->player_paths[i], m->player_paths[i], w, h, NULL);
+            die("execlp jugador");  /* solo llega acá si execlp falla */
         }
 
-        /
+        /* padre: guardar pid y cerrar extremo de escritura */
+        m->player_pids[i] = pid;
+        close(m->player_pipes[i][1]);
+        m->player_pipes[i][1] = -1;
     }
 
-    // 3) master: se queda solo con lecturas
-    for (int i = 0; i < cantPlayers; i++) {
-        close(m->player_pipes[i][1]);
+    /* ── fork vista ── */
+    m->view_pid = -1;
+    if (m->view_path != NULL) {
+        pid_t pid = fork();
+        if (pid < 0) die("fork vista");
+
+        if (pid == 0) {
+            /* la vista no usa pipes, solo conecta las shared memories */
+            execlp(m->view_path, m->view_path, w, h, NULL);
+            die("execlp vista");
+        }
+
+        m->view_pid = pid;
     }
-    close(m->view_pipe[0]);
-    dup2(m->view_pipe[1], STDOUT_FILENO);
-    close(m->view_pipe[1]);
 }
 
+/* ── cleanup ─────────────────────────────────────────────────────────────── */
 
-// /*/* ── helpers ─────────────────────────────────────────────────────────────── */
- 
-// static void die(const char *msg) {
-//     perror(msg);
-//     exit(EXIT_FAILURE);
-// }
+static void cleanup(Master *m) {
+    if (m->sync != NULL) {
+        GameSync *s = m->sync;
+        sem_destroy(&s->view_notify);
+        sem_destroy(&s->view_done);
+        sem_destroy(&s->no_writer);
+        sem_destroy(&s->state_mutex);
+        sem_destroy(&s->readers_mutex);
+        for (int i = 0; i < m->player_count; i++)
+            sem_destroy(&s->player_ack[i]);
+        munmap(m->sync, sizeof(GameSync));
+        shm_unlink(SHM_SYNC_NAME);
+    }
+    if (m->gs != NULL) {
+        munmap(m->gs, m->state_size);
+        shm_unlink(SHM_STATE_NAME);
+    }
+    /* cerrar pipes que quedaron abiertos */
+    for (int i = 0; i < m->player_count; i++) {
+        if (m->player_pipes[i][0] != -1) close(m->player_pipes[i][0]);
+    }
+}
 
-// /* ── init_game_state ─────────────────────────────────────────────────────
-//  *
-//  * Crea la shared memory /game_state y la inicializa:
-//  *   - dimensiones del tablero
-//  *   - cantidad de jugadores
-//  *   - game_over = false
-//  *   - tablero lleno con recompensas aleatorias 1..9 usando la seed
-//  */
-// static void init_game_state(Master *m) {
-//     /* tamaño total = struct fijo + width*height bytes del tablero */
-//     m->state_size = game_state_size((unsigned short)m->width,
-//                                     (unsigned short)m->height);
- 
-//     /*
-//      * O_CREAT | O_RDWR  → crear si no existe, abrir para lectura/escritura
-//      * O_TRUNC           → si ya existía (run anterior), resetearla
-//      * 0666              → permisos del objeto shm
-//      */
-//     int fd = shm_open(SHM_STATE_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
-//     if (fd == -1) die("shm_open /game_state");
- 
-//     /* darle el tamaño correcto (por defecto tiene tamaño 0) */
-//     if (ftruncate(fd, (off_t)m->state_size) == -1) die("ftruncate /game_state");
- 
-//     /* mapear en nuestro espacio de memoria */
-//     m->gs = mmap(NULL, m->state_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//     if (m->gs == MAP_FAILED) die("mmap /game_state");
- 
-//     /* el fd ya no es necesario una vez mapeado */
-//     close(fd);
- 
-//     /* inicializar campos del struct */
-//     m->gs->width        = (unsigned short)m->width;
-//     m->gs->height       = (unsigned short)m->height;
-//     m->gs->player_count = (unsigned char)m->player_count;
-//     m->gs->game_over    = false;
- 
-//     /*
-//      * Llenar el tablero con recompensas aleatorias entre 1 y 9.
-//      * Usamos la seed para que sea determinístico: misma seed = mismo tablero.
-//      */
-//     srand(m->seed);
-//     int total = m->width * m->height;
-//     for (int i = 0; i < total; i++)
-//         m->gs->board[i] = (char)(rand() % 9 + 1);
- 
-//     printf("shared memory /game_state creada (%zu bytes)\n", m->state_size);
-// }
- 
-// /* ── cleanup parcial (por ahora solo game_state) ─────────────────────────── */
- 
-// static void cleanup(Master *m) {
-//     if (m->gs != NULL) {
-//         munmap(m->gs, m->state_size);
-//         shm_unlink(SHM_STATE_NAME);
-//     }
-// }
- 
+/* ── main ─────────────────────────────────────────────────────────────────── */
 
-// /* ── init_game_sync ──────────────────────────────────────────────────────
-//  *
-//  * Crea la shared memory /game_sync e inicializa todos los semáforos.
-//  *
-//  * Valores iniciales:
-//  *   view_notify  (A) = 0  bloqueado: la vista espera hasta que el master avise
-//  *   view_done    (B) = 0  bloqueado: el master espera hasta que la vista avise
-//  *   no_writer    (C) = 1  libre: ningún escritor esperando todavía
-//  *   state_mutex  (D) = 1  libre: el estado está disponible
-//  *   readers_mutex(E) = 1  libre: el contador de lectores está disponible
-//  *   readers_count(F) = 0  nadie leyendo todavía
-//  *   player_ack[i](G) = 0  bloqueado: cada jugador espera el primer ack
-//  */
-// static void init_game_sync(Master *m) {
-//     int fd = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
-//     if (fd == -1) die("shm_open /game_sync");
- 
-//     if (ftruncate(fd, sizeof(GameSync)) == -1) die("ftruncate /game_sync");
- 
-//     m->sync = mmap(NULL, sizeof(GameSync), PROT_READ | PROT_WRITE,
-//                    MAP_SHARED, fd, 0);
-//     if (m->sync == MAP_FAILED) die("mmap /game_sync");
-//     close(fd);
- 
-//     GameSync *s = m->sync;
- 
-//     /*
-//      * sem_init(sem, pshared, valor)
-//      * pshared = 1 → el semáforo es compartido entre procesos (no solo threads)
-//      *               esto es obligatorio porque vive en shared memory
-//      */
-//     if (sem_init(&s->view_notify,    1, 0) == -1) die("sem_init view_notify");
-//     if (sem_init(&s->view_done,      1, 0) == -1) die("sem_init view_done");
-//     if (sem_init(&s->no_writer,      1, 1) == -1) die("sem_init no_writer");
-//     if (sem_init(&s->state_mutex,    1, 1) == -1) die("sem_init state_mutex");
-//     if (sem_init(&s->readers_mutex,  1, 1) == -1) die("sem_init readers_mutex");
-//     s->readers_count = 0;
- 
-//     for (int i = 0; i < m->player_count; i++) {
-//         if (sem_init(&s->player_ack[i], 1, 0) == -1) die("sem_init player_ack");
-//     }
- 
-//     printf("shared memory /game_sync creada (%zu bytes, %d semáforos)\n",
-//            sizeof(GameSync), 5 + m->player_count);
-// }
- 
-// /* ── cleanup ─────────────────────────────────────────────────────────────── */
- 
-// static void cleanup(Master *m) {
-//     /* destruir semáforos antes de desmapear */
-//     if (m->sync != NULL) {
-//         GameSync *s = m->sync;
-//         sem_destroy(&s->view_notify);
-//         sem_destroy(&s->view_done);
-//         sem_destroy(&s->no_writer);
-//         sem_destroy(&s->state_mutex);
-//         sem_destroy(&s->readers_mutex);
-//         for (int i = 0; i < m->player_count; i++)
-//             sem_destroy(&s->player_ack[i]);
-//         munmap(m->sync, sizeof(GameSync));
-//         shm_unlink(SHM_SYNC_NAME);
-//     }
-//     if (m->gs != NULL) {
-//         munmap(m->gs, m->state_size);
-//         shm_unlink(SHM_STATE_NAME);
-//     }
-// }
-// /* ── main ─────────────────────────────────────────────────────────────────── */
-// int main(int argc, char *argv[]) {
-//     Master m;
-//     memset(&m, 0, sizeof(m));
- 
-//     parse_args(argc, argv, &m);
- 
-//     init_game_state(&m);
-//     init_game_sync(&m);
- 
-//     /* verificación: leer valor actual de cada semáforo */
-//     printf("\nestado inicial de semáforos:\n");
-//     int val;
-//     sem_getvalue(&m.sync->view_notify,   &val); printf("  A view_notify:   %d\n", val);
-//     sem_getvalue(&m.sync->view_done,     &val); printf("  B view_done:     %d\n", val);
-//     sem_getvalue(&m.sync->no_writer,     &val); printf("  C no_writer:     %d\n", val);
-//     sem_getvalue(&m.sync->state_mutex,   &val); printf("  D state_mutex:   %d\n", val);
-//     sem_getvalue(&m.sync->readers_mutex, &val); printf("  E readers_mutex: %d\n", val);
-//     printf("  F readers_count: %u\n", m.sync->readers_count);
-//     for (int i = 0; i < m.player_count; i++) {
-//         sem_getvalue(&m.sync->player_ack[i], &val);
-//         printf("  G player_ack[%d]: %d\n", i, val);
-//     }
- 
-//     cleanup(&m);
- 
-//     printf("\n(próximo paso: place_players)\n");
-//     return EXIT_SUCCESS;
-// }
+int main(int argc, char *argv[]) {
+    Master m;
+    memset(&m, 0, sizeof(m));
+
+    /* inicializar pipe fds a -1 para detectar los no abiertos en cleanup */
+    for (int i = 0; i < MAX_PLAYERS; i++)
+        m.player_pipes[i][0] = m.player_pipes[i][1] = -1;
+
+    parse_args(argc, argv, &m);
+    initGame(&m);       /* 1. crear shared memories y llenar tablero */
+    initSem(&m);        /* 2. inicializar semáforos */
+    initCanales(&m);    /* 3. crear pipes de jugadores */
+    initProcesses(&m);  /* 4. fork vista y jugadores */
+
+    /* TODO: game_loop(&m) — próximo paso */
+
+    cleanup(&m);
+    return EXIT_SUCCESS;
+}
