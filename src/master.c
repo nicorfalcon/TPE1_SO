@@ -267,6 +267,96 @@ static void cleanup(Master *m) {
         if (m->player_pipes[i][0] != -1) close(m->player_pipes[i][0]);
     }
 }
+static void initPlayers(Master *m) {
+    GameState *gs = m->gs;
+    int n = m->player_count;
+
+    /* cuántas columnas y filas de sectores necesitamos
+     * por ejemplo 4 jugadores → cols=2, rows=2
+     *             3 jugadores → cols=3, rows=1
+     *             9 jugadores → cols=3, rows=3
+     */
+    int cols = 1;
+    int rows = 1;
+    while (cols * rows < n) {
+        if (cols <= rows) cols++;
+        else              rows++;
+    }
+
+    /* ancho y alto de cada sector */
+    int sector_w = m->width  / cols;
+    int sector_h = m->height / rows;
+
+    for (int i = 0; i < n; i++) {
+        int col = i % cols;
+        int row = i / cols;
+
+        /* centro del sector */
+        int x = col * sector_w + sector_w / 2;
+        int y = row * sector_h + sector_h / 2;
+
+        gs->players[i].x = (unsigned short)x;
+        gs->players[i].y = (unsigned short)y;
+        gs->players[i].score         = 0;
+        gs->players[i].valid_moves   = 0;
+        gs->players[i].invalid_moves = 0;
+        gs->players[i].blocked       = false;
+        gs->players[i].pid           = m->player_pids[i];
+
+        /* nombre del jugador: "player_0", "player_1", etc */
+        snprintf(gs->players[i].name, sizeof(gs->players[i].name),
+                 "player_%d", i);
+
+        /* la celda inicial no da recompensa, la marcamos como capturada */
+        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
+    }
+}
+static void initPlayers(Master *m) {
+    GameState *gs = m->gs;
+    int n = m->player_count;
+
+    /* cuántas columnas y filas de sectores necesitamos
+     * por ejemplo 4 jugadores → cols=2, rows=2
+     *             3 jugadores → cols=3, rows=1
+     *             9 jugadores → cols=3, rows=3
+     */
+    int cols = 1;
+    int rows = 1;
+    while (cols * rows < n) {
+        if (cols <= rows) cols++;
+        else              rows++;
+    }
+
+    /* ancho y alto de cada sector */
+    int sector_w = m->width  / cols;
+    int sector_h = m->height / rows;
+
+    for (int i = 0; i < n; i++) {
+        int col = i % cols;
+        int row = i / cols;
+
+        /* centro del sector */
+        int x = col * sector_w + sector_w / 2;
+        int y = row * sector_h + sector_h / 2;
+
+        gs->players[i].x = (unsigned short)x;
+        gs->players[i].y = (unsigned short)y;
+        gs->players[i].score         = 0;
+        gs->players[i].valid_moves   = 0;
+        gs->players[i].invalid_moves = 0;
+        gs->players[i].blocked       = false;
+        gs->players[i].pid           = m->player_pids[i];
+
+        /* nombre del jugador: "player_0", "player_1", etc */
+        snprintf(gs->players[i].name, sizeof(gs->players[i].name),
+                 "player_%d", i);
+
+        /* la celda inicial no da recompensa, la marcamos como capturada */
+        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
+    }
+}
+
+
 
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
@@ -283,8 +373,9 @@ int main(int argc, char *argv[]) {
     initSem(&m);        /* 2. inicializar semáforos */
     initCanales(&m);    /* 3. crear pipes de jugadores */
     initProcesses(&m);  /* 4. fork vista y jugadores */
-
+    initPlayers(&m);    /* 5. inicializar posiciones de jugadores */
     /* TODO: game_loop(&m) — próximo paso */
+    game_loop(&m);
 
     cleanup(&m);
     return EXIT_SUCCESS;
