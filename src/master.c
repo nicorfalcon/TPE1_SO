@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <semaphore.h>
@@ -13,6 +14,7 @@
 
 #include "include/game_state.h"
 #include "include/game_sync.h"
+#include "include/protocol.h"
 
 /* ── constantes ──────────────────────────────────────────────────────────── */
 
@@ -107,7 +109,6 @@ static void parse_args(int argc, char *argv[], Master *m) {
 /* ── initGame: crea las dos shared memories ──────────────────────────────── */
 
 static void initGame(Master *m) {
-    /* ── /game_state ── */
     m->state_size = game_state_size((unsigned short)m->width,
                                     (unsigned short)m->height);
 
@@ -118,19 +119,16 @@ static void initGame(Master *m) {
     if (m->gs == MAP_FAILED) die("mmap /game_state");
     close(fdState);
 
-    /* inicializar campos */
     m->gs->width        = (unsigned short)m->width;
     m->gs->height       = (unsigned short)m->height;
     m->gs->player_count = (unsigned char)m->player_count;
     m->gs->game_over    = false;
 
-    /* llenar tablero con recompensas aleatorias 1-9 */
     srand(m->seed);
     int total = m->width * m->height;
     for (int i = 0; i < total; i++)
         m->gs->board[i] = (char)(rand() % 9 + 1);
 
-    /* ── /game_sync ── */
     int fdSync = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fdSync == -1) die("shm_open /game_sync");
     if (ftruncate(fdSync, sizeof(GameSync)) == -1) die("ftruncate /game_sync");
@@ -139,108 +137,408 @@ static void initGame(Master *m) {
     close(fdSync);
 }
 
-/* ── initSem: inicializa los semáforos ───────────────────────────────────── */
+/* ── initSem ─────────────────────────────────────────────────────────────── */
 
 static void initSem(Master *m) {
     GameSync *s = m->sync;
-
-    /*
-     * sem_init(sem, pshared=1, valor)
-     * pshared=1 → compartido entre procesos (vive en shared memory)
-     *
-     * A y B en 0: señalización, arrancan bloqueados
-     * C, D, E en 1: mutex, arrancan libres
-     * G[i] en 0: cada jugador espera el primer ack del master
-     */
     if (sem_init(&s->view_notify,   1, 0) == -1) die("sem_init view_notify");
     if (sem_init(&s->view_done,     1, 0) == -1) die("sem_init view_done");
     if (sem_init(&s->no_writer,     1, 1) == -1) die("sem_init no_writer");
     if (sem_init(&s->state_mutex,   1, 1) == -1) die("sem_init state_mutex");
     if (sem_init(&s->readers_mutex, 1, 1) == -1) die("sem_init readers_mutex");
     s->readers_count = 0;
-
-    for (int i = 0; i < m->player_count; i++) {
+    for (int i = 0; i < m->player_count; i++)
         if (sem_init(&s->player_ack[i], 1, 0) == -1) die("sem_init player_ack");
-    }
 }
 
-/* ── initCanales: crea los pipes de los jugadores ───────────────────────── */
+/* ── initCanales ─────────────────────────────────────────────────────────── */
 
 static void initCanales(Master *m) {
-    for (int i = 0; i < m->player_count; i++) {
+    for (int i = 0; i < m->player_count; i++)
         if (pipe(m->player_pipes[i]) == -1) die("pipe");
-    }
 }
 
-/* ── initProcesses: fork de vista y jugadores ────────────────────────────
- *
- * Para cada jugador:
- *   1. fork()
- *   2. hijo: cierra todos los pipes que no le pertenecen,
- *            redirige su extremo de escritura a stdout (fd 1),
- *            ejecuta el binario del jugador con execlp
- *   3. padre: guarda el pid, cierra el extremo de escritura
- *             (el master solo lee)
- *
- * Para la vista:
- *   1. fork()
- *   2. hijo: ejecuta el binario de la vista pasando width y height
- *   3. padre: guarda el pid
- *
- * La vista NO usa pipes — se comunica solo por shared memory + semáforos A/B.
- */
+/* ── initProcesses ───────────────────────────────────────────────────────── */
+
 static void initProcesses(Master *m) {
     char w[16], h[16];
     snprintf(w, sizeof(w), "%d", m->width);
     snprintf(h, sizeof(h), "%d", m->height);
 
-    /* ── fork jugadores ── */
     for (int i = 0; i < m->player_count; i++) {
         pid_t pid = fork();
         if (pid < 0) die("fork jugador");
 
         if (pid == 0) {
-            /* hijo: cerrar todos los pipes que no son el mío */
             for (int j = 0; j < m->player_count; j++) {
                 if (j == i) {
-                    /* mi pipe: cierro el extremo de lectura (lo usa el master) */
                     close(m->player_pipes[j][0]);
                 } else {
-                    /* pipe ajeno: cierro ambos extremos */
                     close(m->player_pipes[j][0]);
                     close(m->player_pipes[j][1]);
                 }
             }
-
-            /* redirigir escritura a stdout para que el master pueda leer */
             if (dup2(m->player_pipes[i][1], STDOUT_FILENO) == -1) die("dup2");
             close(m->player_pipes[i][1]);
-
-            /* ejecutar el jugador pasando width y height */
             execlp(m->player_paths[i], m->player_paths[i], w, h, NULL);
-            die("execlp jugador");  /* solo llega acá si execlp falla */
+            die("execlp jugador");
         }
 
-        /* padre: guardar pid y cerrar extremo de escritura */
         m->player_pids[i] = pid;
         close(m->player_pipes[i][1]);
         m->player_pipes[i][1] = -1;
     }
 
-    /* ── fork vista ── */
     m->view_pid = -1;
     if (m->view_path != NULL) {
         pid_t pid = fork();
         if (pid < 0) die("fork vista");
-
         if (pid == 0) {
-            /* la vista no usa pipes, solo conecta las shared memories */
             execlp(m->view_path, m->view_path, w, h, NULL);
             die("execlp vista");
         }
-
         m->view_pid = pid;
     }
+}
+
+/* ── initPlayers ─────────────────────────────────────────────────────────── */
+
+static void initPlayers(Master *m) {
+    GameState *gs = m->gs;
+    int n = m->player_count;
+
+    int cols = 1, rows = 1;
+    while (cols * rows < n) {
+        if (cols <= rows) cols++;
+        else              rows++;
+    }
+
+    int sector_w = m->width  / cols;
+    int sector_h = m->height / rows;
+
+    for (int i = 0; i < n; i++) {
+        int col = i % cols;
+        int row = i / cols;
+        int x   = col * sector_w + sector_w / 2;
+        int y   = row * sector_h + sector_h / 2;
+
+        gs->players[i].x             = (unsigned short)x;
+        gs->players[i].y             = (unsigned short)y;
+        gs->players[i].score         = 0;
+        gs->players[i].valid_moves   = 0;
+        gs->players[i].invalid_moves = 0;
+        gs->players[i].blocked       = false;
+        gs->players[i].pid           = m->player_pids[i];
+        snprintf(gs->players[i].name, sizeof(gs->players[i].name), "player_%d", i);
+        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
+    }
+}
+
+/* ── lock_write / unlock_write ───────────────────────────────────────────
+ *
+ * El master es el único escritor. Para escribir en el estado:
+ *
+ *   lock_write:
+ *     sem_wait(C/no_writer)   ← anuncia intención: nuevos lectores se bloquean
+ *     sem_wait(D/state_mutex) ← espera a que los lectores actuales terminen
+ *
+ *   unlock_write:
+ *     sem_post(D/state_mutex) ← libera a cualquier lector esperando en D
+ *     sem_post(C/no_writer)   ← permite que lleguen nuevos lectores
+ */
+static void lock_write(GameSync *sync) {
+    if (sem_wait(&sync->no_writer)   == -1) die("sem_wait no_writer (write)");
+    if (sem_wait(&sync->state_mutex) == -1) die("sem_wait state_mutex (write)");
+}
+
+static void unlock_write(GameSync *sync) {
+    if (sem_post(&sync->state_mutex) == -1) die("sem_post state_mutex (write)");
+    if (sem_post(&sync->no_writer)   == -1) die("sem_post no_writer (write)");
+}
+
+/* ── notify_view ─────────────────────────────────────────────────────────
+ *
+ * Avisa a la vista que hay cambios y espera a que termine de imprimir.
+ * Solo se llama si hay vista activa (view_pid != -1).
+ */
+static void notify_view(Master *m) {
+    if (m->view_pid == -1) return;
+    if (sem_post(&m->sync->view_notify) == -1) die("sem_post view_notify");
+    if (sem_wait(&m->sync->view_done)   == -1) die("sem_wait view_done");
+}
+
+/* ── is_cell_free ────────────────────────────────────────────────────────── */
+
+static bool is_cell_free(const GameState *gs, int x, int y) {
+    if (x < 0 || x >= gs->width)  return false;
+    if (y < 0 || y >= gs->height) return false;
+    return gs->board[y * gs->width + x] > 0;
+}
+
+/* ── update_blocked ──────────────────────────────────────────────────────
+ *
+ * Recorre las 8 direcciones del jugador i y actualiza su campo blocked.
+ * Un jugador está bloqueado si ninguna celda adyacente está libre.
+ */
+static void update_blocked(GameState *gs, int idx) {
+    Player *p = &gs->players[idx];
+    for (int d = 0; d < DIRS; d++) {
+        int nx = (int)p->x + DX[d];
+        int ny = (int)p->y + DY[d];
+        if (is_cell_free(gs, nx, ny)) {
+            p->blocked = false;
+            return;
+        }
+    }
+    p->blocked = true;
+}
+
+/* ── apply_move ──────────────────────────────────────────────────────────
+ *
+ * Valida y aplica el movimiento del jugador idx.
+ * Devuelve true si el movimiento fue válido, false si no.
+ *
+ * Movimiento válido:
+ *   1. dirección en rango [0, DIRS)
+ *   2. celda destino dentro del tablero
+ *   3. celda destino libre (valor > 0)
+ *
+ * Si es válido:
+ *   - captura la celda (board = -idx)
+ *   - suma la recompensa al puntaje
+ *   - actualiza posición
+ *   - incrementa valid_moves
+ *   - actualiza blocked de todos los jugadores
+ *
+ * Si es inválido:
+ *   - incrementa invalid_moves
+ */
+static bool apply_move(GameState *gs, int idx, unsigned char dir) {
+    Player *p = &gs->players[idx];
+
+    if (dir >= DIRS) {
+        p->invalid_moves++;
+        return false;
+    }
+
+    int nx = (int)p->x + DX[dir];
+    int ny = (int)p->y + DY[dir];
+
+    if (!is_cell_free(gs, nx, ny)) {
+        p->invalid_moves++;
+        return false;
+    }
+
+    /* movimiento válido */
+    char reward = gs->board[ny * gs->width + nx];
+    gs->board[ny * gs->width + nx] = (char)(-idx);
+    p->score += (unsigned int)reward;
+    p->x = (unsigned short)nx;
+    p->y = (unsigned short)ny;
+    p->valid_moves++;
+
+    /* actualizar blocked de todos (un movimiento puede desbloquear a otro) */
+    for (int i = 0; i < gs->player_count; i++)
+        update_blocked(gs, i);
+
+    return true;
+}
+
+/* ── all_blocked ─────────────────────────────────────────────────────────── */
+
+static bool all_blocked(const GameState *gs) {
+    for (int i = 0; i < gs->player_count; i++)
+        if (!gs->players[i].blocked) return false;
+    return true;
+}
+
+/* ── wait_children ───────────────────────────────────────────────────────
+ *
+ * Espera a que terminen todos los hijos e imprime su estado de salida.
+ * Para jugadores también imprime el puntaje final.
+ */
+static void wait_children(Master *m) {
+    /* esperar jugadores */
+    for (int i = 0; i < m->player_count; i++) {
+        int status;
+        pid_t pid = waitpid(m->player_pids[i], &status, 0);
+        if (pid == -1) { perror("waitpid jugador"); continue; }
+
+        fprintf(stderr, "jugador %d (pid %d): score=%u  ",
+                i, (int)pid, m->gs->players[i].score);
+
+        if (WIFEXITED(status))
+            fprintf(stderr, "exit(%d)\n", WEXITSTATUS(status));
+        else if (WIFSIGNALED(status))
+            fprintf(stderr, "señal %d\n", WTERMSIG(status));
+        else
+            fprintf(stderr, "terminó de forma desconocida\n");
+    }
+
+    /* esperar vista */
+    if (m->view_pid != -1) {
+        int status;
+        pid_t pid = waitpid(m->view_pid, &status, 0);
+        if (pid == -1) { perror("waitpid vista"); return; }
+
+        fprintf(stderr, "vista (pid %d): ", (int)pid);
+        if (WIFEXITED(status))
+            fprintf(stderr, "exit(%d)\n", WEXITSTATUS(status));
+        else if (WIFSIGNALED(status))
+            fprintf(stderr, "señal %d\n", WTERMSIG(status));
+        else
+            fprintf(stderr, "terminó de forma desconocida\n");
+    }
+}
+
+/* ── game_loop ───────────────────────────────────────────────────────────
+ *
+ * Flujo general por iteración:
+ *
+ *   1. Armar fd_set con los pipes de jugadores no bloqueados y no EOF.
+ *   2. select() con timeout calculado en base al tiempo restante.
+ *   3. Si timeout → terminar juego.
+ *   4. Si hay datos: recorrer en round-robin y atender UNO por vuelta.
+ *      a. read() del pipe → 1 byte (dirección)
+ *      b. Si EOF → marcar bloqueado, cerrar pipe.
+ *      c. Si hay byte → lock_write, apply_move, unlock_write.
+ *      d. sem_post(player_ack[i]) → el jugador puede enviar el siguiente.
+ *      e. Si el movimiento fue válido → resetear timer.
+ *   5. Notificar vista y esperar delay.
+ *   6. Chequear fin: all_blocked o timeout.
+ *
+ * Round-robin: last_served guarda el último índice atendido.
+ * La próxima búsqueda empieza desde (last_served+1) % n.
+ */
+static void game_loop(Master *m) {
+    GameState *gs   = m->gs;
+    GameSync  *sync = m->sync;
+    int        n    = m->player_count;
+
+    /* pipe_open[i]: true mientras el pipe del jugador i está activo */
+    bool pipe_open[MAX_PLAYERS];
+    for (int i = 0; i < n; i++) pipe_open[i] = true;
+
+    /* máximo fd para select() */
+    int max_fd = 0;
+    for (int i = 0; i < n; i++)
+        if (m->player_pipes[i][0] > max_fd)
+            max_fd = m->player_pipes[i][0];
+
+    /* dar largada: sem_post(player_ack[i]) para cada jugador */
+    for (int i = 0; i < n; i++)
+        if (sem_post(&sync->player_ack[i]) == -1) die("sem_post player_ack largada");
+
+    /* timer: cuándo fue el último movimiento válido */
+    struct timespec last_valid;
+    clock_gettime(CLOCK_MONOTONIC, &last_valid);
+
+    int last_served = n - 1; /* empezamos desde 0 en la primera vuelta */
+
+    while (1) {
+        /* ── chequeo de fin por all_blocked ── */
+        if (all_blocked(gs)) break;
+
+        /* ── armar fd_set ── */
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        int active = 0;
+        for (int i = 0; i < n; i++) {
+            if (pipe_open[i] && !gs->players[i].blocked) {
+                FD_SET(m->player_pipes[i][0], &read_fds);
+                active++;
+            }
+        }
+
+        /* si no hay ningún pipe activo (todos bloqueados o cerrados), salir */
+        if (active == 0) break;
+
+        /* ── calcular tiempo restante para el timeout ── */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec  - last_valid.tv_sec) +
+                         (double)(now.tv_nsec - last_valid.tv_nsec) / 1e9;
+        double remaining = (double)m->timeout_s - elapsed;
+        if (remaining <= 0.0) break; /* timeout ya superado */
+
+        struct timeval tv;
+        tv.tv_sec  = (time_t)remaining;
+        tv.tv_usec = (suseconds_t)((remaining - (double)tv.tv_sec) * 1e6);
+
+        /* ── select ── */
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ret < 0)  die("select");
+        if (ret == 0) break; /* timeout */
+
+        /* ── round-robin: atender uno por vuelta ── */
+        for (int i = 0; i < n; i++) {
+            int idx = (last_served + 1 + i) % n;
+
+            if (!pipe_open[idx])           continue;
+            if (gs->players[idx].blocked)  continue;
+            if (!FD_ISSET(m->player_pipes[idx][0], &read_fds)) continue;
+
+            /* leer 1 byte del pipe */
+            unsigned char dir;
+            ssize_t r = read(m->player_pipes[idx][0], &dir, 1);
+
+            if (r == 0) {
+                /* EOF: el jugador cerró su extremo del pipe → bloqueado */
+                pipe_open[idx] = false;
+                close(m->player_pipes[idx][0]);
+                m->player_pipes[idx][0] = -1;
+
+                lock_write(sync);
+                gs->players[idx].blocked = true;
+                unlock_write(sync);
+
+                last_served = idx;
+                break;
+            }
+
+            if (r < 0) die("read pipe jugador");
+
+            /* aplicar movimiento dentro del lock de escritura */
+            lock_write(sync);
+            bool valid = apply_move(gs, idx, dir);
+            unlock_write(sync);
+
+            /* ack al jugador: ya puede enviar el siguiente movimiento */
+            if (sem_post(&sync->player_ack[idx]) == -1) die("sem_post player_ack");
+
+            /* si fue válido, resetear el timer */
+            if (valid)
+                clock_gettime(CLOCK_MONOTONIC, &last_valid);
+
+            /* notificar vista y esperar que imprima */
+            notify_view(m);
+
+            /* delay entre impresiones */
+            if (m->delay_ms > 0)
+                usleep((useconds_t)m->delay_ms * 1000);
+
+            last_served = idx;
+            break; /* una sola solicitud por vuelta */
+        }
+    }
+
+    /* ── fin del juego ── */
+    lock_write(sync);
+    gs->game_over = true;
+    unlock_write(sync);
+
+    /* notificar a la vista el estado final */
+    notify_view(m);
+
+    /*
+     * Desbloquear a todos los jugadores que puedan estar esperando en
+     * player_ack[i] para que puedan leer game_over y salir limpiamente.
+     */
+    for (int i = 0; i < n; i++)
+        if (sem_post(&sync->player_ack[i]) == -1) die("sem_post player_ack fin");
+
+    /* esperar a que todos los hijos terminen e imprimir su estado */
+    wait_children(m);
 }
 
 /* ── cleanup ─────────────────────────────────────────────────────────────── */
@@ -262,101 +560,9 @@ static void cleanup(Master *m) {
         munmap(m->gs, m->state_size);
         shm_unlink(SHM_STATE_NAME);
     }
-    /* cerrar pipes que quedaron abiertos */
-    for (int i = 0; i < m->player_count; i++) {
+    for (int i = 0; i < m->player_count; i++)
         if (m->player_pipes[i][0] != -1) close(m->player_pipes[i][0]);
-    }
 }
-static void initPlayers(Master *m) {
-    GameState *gs = m->gs;
-    int n = m->player_count;
-
-    /* cuántas columnas y filas de sectores necesitamos
-     * por ejemplo 4 jugadores → cols=2, rows=2
-     *             3 jugadores → cols=3, rows=1
-     *             9 jugadores → cols=3, rows=3
-     */
-    int cols = 1;
-    int rows = 1;
-    while (cols * rows < n) {
-        if (cols <= rows) cols++;
-        else              rows++;
-    }
-
-    /* ancho y alto de cada sector */
-    int sector_w = m->width  / cols;
-    int sector_h = m->height / rows;
-
-    for (int i = 0; i < n; i++) {
-        int col = i % cols;
-        int row = i / cols;
-
-        /* centro del sector */
-        int x = col * sector_w + sector_w / 2;
-        int y = row * sector_h + sector_h / 2;
-
-        gs->players[i].x = (unsigned short)x;
-        gs->players[i].y = (unsigned short)y;
-        gs->players[i].score         = 0;
-        gs->players[i].valid_moves   = 0;
-        gs->players[i].invalid_moves = 0;
-        gs->players[i].blocked       = false;
-        gs->players[i].pid           = m->player_pids[i];
-
-        /* nombre del jugador: "player_0", "player_1", etc */
-        snprintf(gs->players[i].name, sizeof(gs->players[i].name),
-                 "player_%d", i);
-
-        /* la celda inicial no da recompensa, la marcamos como capturada */
-        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
-    }
-}
-static void initPlayers(Master *m) {
-    GameState *gs = m->gs;
-    int n = m->player_count;
-
-    /* cuántas columnas y filas de sectores necesitamos
-     * por ejemplo 4 jugadores → cols=2, rows=2
-     *             3 jugadores → cols=3, rows=1
-     *             9 jugadores → cols=3, rows=3
-     */
-    int cols = 1;
-    int rows = 1;
-    while (cols * rows < n) {
-        if (cols <= rows) cols++;
-        else              rows++;
-    }
-
-    /* ancho y alto de cada sector */
-    int sector_w = m->width  / cols;
-    int sector_h = m->height / rows;
-
-    for (int i = 0; i < n; i++) {
-        int col = i % cols;
-        int row = i / cols;
-
-        /* centro del sector */
-        int x = col * sector_w + sector_w / 2;
-        int y = row * sector_h + sector_h / 2;
-
-        gs->players[i].x = (unsigned short)x;
-        gs->players[i].y = (unsigned short)y;
-        gs->players[i].score         = 0;
-        gs->players[i].valid_moves   = 0;
-        gs->players[i].invalid_moves = 0;
-        gs->players[i].blocked       = false;
-        gs->players[i].pid           = m->player_pids[i];
-
-        /* nombre del jugador: "player_0", "player_1", etc */
-        snprintf(gs->players[i].name, sizeof(gs->players[i].name),
-                 "player_%d", i);
-
-        /* la celda inicial no da recompensa, la marcamos como capturada */
-        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
-    }
-}
-
-
 
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
@@ -364,19 +570,16 @@ int main(int argc, char *argv[]) {
     Master m;
     memset(&m, 0, sizeof(m));
 
-    /* inicializar pipe fds a -1 para detectar los no abiertos en cleanup */
     for (int i = 0; i < MAX_PLAYERS; i++)
         m.player_pipes[i][0] = m.player_pipes[i][1] = -1;
 
     parse_args(argc, argv, &m);
     initGame(&m);       /* 1. crear shared memories y llenar tablero */
-    initSem(&m);        /* 2. inicializar semáforos */
-    initCanales(&m);    /* 3. crear pipes de jugadores */
-    initProcesses(&m);  /* 4. fork vista y jugadores */
-    initPlayers(&m);    /* 5. inicializar posiciones de jugadores */
-    /* TODO: game_loop(&m) — próximo paso */
-    game_loop(&m);
-
-    cleanup(&m);
+    initSem(&m);        /* 2. inicializar semáforos                  */
+    initCanales(&m);    /* 3. crear pipes de jugadores               */
+    initProcesses(&m);  /* 4. fork vista y jugadores                 */
+    initPlayers(&m);    /* 5. posiciones iniciales + PIDs            */
+    game_loop(&m);      /* 6. el juego                               */
+    cleanup(&m);        /* 7. liberar recursos                       */
     return EXIT_SUCCESS;
 }
