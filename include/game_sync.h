@@ -1,5 +1,3 @@
-Game sync · H
-Copy
 
 #ifndef GAME_SYNC_H
 #define GAME_SYNC_H

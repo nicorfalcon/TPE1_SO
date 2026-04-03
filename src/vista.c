@@ -8,8 +8,8 @@
 #include <semaphore.h>
 #include <stdbool.h>
 
-#include "include/game_state.h"
-#include "include/game_sync.h"
+#include "game_state.h"
+#include "game_sync.h"
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
