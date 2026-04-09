@@ -1,0 +1,16 @@
+# Binarios compilados
+bin/
+master
+player
+vista
+
+# Archivos objeto
+*.o
+*.d
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
