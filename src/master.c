@@ -459,6 +459,40 @@ static int serve_round_robin(Master *m, bool *pipe_open, fd_set *read_fds,
     return last_served;
 }
 
+/* ── print_winner ───────────────────────────────────────────────────────── */
+
+static void print_winner(const GameState *gs) {
+    int winner = 0;
+    bool empate = false;
+
+    for (int i = 1; i < (int)gs->player_count; i++) {
+        const Player *w = &gs->players[winner];
+        const Player *c = &gs->players[i];
+
+        if (c->score > w->score) {
+            winner = i; empate = false;
+        } else if (c->score == w->score) {
+            if (c->valid_moves < w->valid_moves) {
+                winner = i; empate = false;
+            } else if (c->valid_moves == w->valid_moves) {
+                if (c->invalid_moves < w->invalid_moves) {
+                    winner = i; empate = false;
+                } else if (c->invalid_moves == w->invalid_moves) {
+                    empate = true;
+                }
+            }
+        }
+    }
+
+    if (empate) {
+        fprintf(stderr, "empate\n");
+    } else {
+        const Player *w = &gs->players[winner];
+        fprintf(stderr, "ganador: %s  score=%u  valid=%u  invalid=%u\n",
+                w->name, w->score, w->valid_moves, w->invalid_moves);
+    }
+}
+
 /* ── finalize_game ──────────────────────────────────────────────────────── */
 
 static void finalize_game(Master *m) {
@@ -469,6 +503,7 @@ static void finalize_game(Master *m) {
     for (int i = 0; i < m->player_count; i++)
         if (sem_post(&m->sync->player_ack[i]) == -1) die("sem_post player_ack fin");
     wait_children(m);
+    print_winner(m->gs);
 }
 
 /* ── game_loop ──────────────────────────────────────────────────────────── */

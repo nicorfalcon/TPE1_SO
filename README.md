@@ -16,6 +16,9 @@ La sincronización entre el master y la vista es más simple: señalización bid
 ### Round-robin
 El master atiende las solicitudes de los jugadores siguiendo una política round-robin mediante la variable `last_served`, que recuerda el último jugador atendido y continúa desde el siguiente en la próxima iteración. Esto evita favorecer sistemáticamente a un mismo jugador.
 
+### Pipes anónimos como canal jugador → master
+Se utilizó un pipe anónimo por jugador (`pipe(2)`) como canal unidireccional de comunicación: el extremo de escritura se remapea al `fd 1` del hijo mediante `dup2` antes de ejecutar el binario del jugador, de modo que cada `write` del jugador llega al master sin que el jugador conozca el mecanismo subyacente. El master retiene únicamente el extremo de lectura de cada pipe. Para evitar bloquearse esperando a un único jugador, el master usa `select(2)` sobre todos los fds de lectura activos simultáneamente, atendiendo al primero que tenga datos disponibles siguiendo la política round-robin. Un `EOF` en el pipe (retorno de `read` igual a 0) se interpreta como que el jugador terminó o quedó bloqueado, y el master lo marca como tal sin esperar respuesta adicional.
+
 ### Distribución inicial de jugadores
 Los jugadores son ubicados en el centro de sectores del tablero divididos en una grilla. Por ejemplo, con 4 jugadores el tablero se divide en 4 sectores de 2x2 y cada jugador arranca en el centro de su sector. Esto garantiza una distribución determinística con margen de movimiento similar para todos.
 
@@ -68,6 +71,7 @@ Ejemplo con 3 jugadores, vista y tablero de 20x20:
 - El jugador no implementa ninguna estrategia cooperativa ni anticipación de movimientos de otros jugadores. La IA toma decisiones basadas únicamente en el estado actual del tablero sin lookahead multi-paso.
 - La vista limpia la pantalla con secuencias ANSI (`\033[2J`), por lo que puede no funcionar correctamente en terminales que no soporten estos códigos.
 - No se implementaron los chequeos de consistencia de la estructura `GameSync` que realiza el master provisto por la cátedra (la opción `-i`).
+- No se ejecutó PVS-Studio en el entorno de desarrollo (contenedor sin licencia); queda pendiente su análisis antes de la entrega final.
 
 ---
 
@@ -79,7 +83,9 @@ Ejemplo con 3 jugadores, vista y tablero de 20x20:
 
 ---
 
-## Citas y uso de IA
+## Citas de fragmentos de código / uso de IA
+
+No se utilizaron fragmentos de código copiados de fuentes externas; todo el código fue escrito por los integrantes del grupo.
 
 Se utilizaron herramientas de inteligencia artificial (**Claude** de Anthropic y **ChatGPT**) como apoyo para:
 - Entender los conceptos de IPC y sincronización (semáforos, shared memory, pipes).
