@@ -122,35 +122,48 @@ static void parse_args(int argc, char *argv[], Master *m) {
     validate_args(m);
 }
 
+/* ── init_state_shm ─────────────────────────────────────────────────────── */
+
+static void init_state_shm(Master *m) {
+    int fd = shm_open(SHM_STATE_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd == -1) die("shm_open /game_state");
+    if (ftruncate(fd, (off_t)m->state_size) == -1) die("ftruncate /game_state");
+    m->gs = mmap(NULL, m->state_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m->gs == MAP_FAILED) die("mmap /game_state");
+    close(fd);
+    m->gs->width        = (unsigned short)m->width;
+    m->gs->height       = (unsigned short)m->height;
+    m->gs->player_count = (unsigned char)m->player_count;
+    m->gs->game_over    = false;
+}
+
+/* ── fill_board_food ────────────────────────────────────────────────────── */
+
+static void fill_board_food(GameState *gs, int total) {
+    for (int i = 0; i < total; i++)
+        gs->board[i] = (signed char)(rand() % 9 + 1);
+}
+
+/* ── init_sync_shm ──────────────────────────────────────────────────────── */
+
+static void init_sync_shm(Master *m) {
+    int fd = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd == -1) die("shm_open /game_sync");
+    if (ftruncate(fd, sizeof(GameSync)) == -1) die("ftruncate /game_sync");
+    m->sync = mmap(NULL, sizeof(GameSync), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m->sync == MAP_FAILED) die("mmap /game_sync");
+    close(fd);
+}
+
 /* ── initGame: crea las dos shared memories ──────────────────────────────── */
 
 static void initGame(Master *m) {
     m->state_size = game_state_size((unsigned short)m->width,
                                     (unsigned short)m->height);
-
-    int fdState = shm_open(SHM_STATE_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
-    if (fdState == -1) die("shm_open /game_state");
-    if (ftruncate(fdState, (off_t)m->state_size) == -1) die("ftruncate /game_state");
-    m->gs = mmap(NULL, m->state_size, PROT_READ | PROT_WRITE, MAP_SHARED, fdState, 0);
-    if (m->gs == MAP_FAILED) die("mmap /game_state");
-    close(fdState);
-
-    m->gs->width        = (unsigned short)m->width;
-    m->gs->height       = (unsigned short)m->height;
-    m->gs->player_count = (unsigned char)m->player_count;
-    m->gs->game_over    = false;
-
+    init_state_shm(m);
     srand(m->seed);
-    int total = m->width * m->height;
-    for (int i = 0; i < total; i++)
-        m->gs->board[i] = (signed char)(rand() % 9 + 1);
-
-    int fdSync = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
-    if (fdSync == -1) die("shm_open /game_sync");
-    if (ftruncate(fdSync, sizeof(GameSync)) == -1) die("ftruncate /game_sync");
-    m->sync = mmap(NULL, sizeof(GameSync), PROT_READ | PROT_WRITE, MAP_SHARED, fdSync, 0);
-    if (m->sync == MAP_FAILED) die("mmap /game_sync");
-    close(fdSync);
+    fill_board_food(m->gs, m->width * m->height);
+    init_sync_shm(m);
 }
 
 /* ── initSem ─────────────────────────────────────────────────────────────── */
@@ -225,36 +238,45 @@ static void initProcesses(Master *m) {
     spawn_view(m, w, h);
 }
 
-/* ── initPlayers ─────────────────────────────────────────────────────────── */
+/* ── calc_grid ──────────────────────────────────────────────────────────── */
 
-static void initPlayers(Master *m) {
-    GameState *gs = m->gs;
-    int n = m->player_count;
-
+static void calc_grid(int n, int *cols_out, int *rows_out) {
     int cols = 1, rows = 1;
     while (cols * rows < n) {
         if (cols <= rows) cols++;
         else              rows++;
     }
+    *cols_out = cols;
+    *rows_out = rows;
+}
 
+/* ── init_single_player ─────────────────────────────────────────────────── */
+
+static void init_single_player(GameState *gs, int i, int x, int y, pid_t pid) {
+    gs->players[i].x             = (unsigned short)x;
+    gs->players[i].y             = (unsigned short)y;
+    gs->players[i].score         = 0;
+    gs->players[i].valid_moves   = 0;
+    gs->players[i].invalid_moves = 0;
+    gs->players[i].blocked       = false;
+    gs->players[i].pid           = pid;
+    snprintf(gs->players[i].name, sizeof(gs->players[i].name), "player_%d", i);
+    *board_cell(gs, (unsigned short)x, (unsigned short)y) = (signed char)(-(i + 1));
+}
+
+/* ── initPlayers ─────────────────────────────────────────────────────────── */
+
+static void initPlayers(Master *m) {
+    GameState *gs = m->gs;
+    int n = m->player_count;
+    int cols, rows;
+    calc_grid(n, &cols, &rows);
     int sector_w = m->width  / cols;
     int sector_h = m->height / rows;
-
     for (int i = 0; i < n; i++) {
-        int col = i % cols;
-        int row = i / cols;
-        int x   = col * sector_w + sector_w / 2;
-        int y   = row * sector_h + sector_h / 2;
-
-        gs->players[i].x             = (unsigned short)x;
-        gs->players[i].y             = (unsigned short)y;
-        gs->players[i].score         = 0;
-        gs->players[i].valid_moves   = 0;
-        gs->players[i].invalid_moves = 0;
-        gs->players[i].blocked       = false;
-        gs->players[i].pid           = m->player_pids[i];
-        snprintf(gs->players[i].name, sizeof(gs->players[i].name), "player_%d", i);
-        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (signed char)(-(i + 1));
+        int x = (i % cols) * sector_w + sector_w / 2;
+        int y = (i / cols) * sector_h + sector_h / 2;
+        init_single_player(gs, i, x, y, m->player_pids[i]);
     }
 }
 
@@ -301,34 +323,44 @@ static void update_blocked(GameState *gs, int idx) {
     p->blocked = true;
 }
 
-/* ── apply_move ─────────────────────────────────────────────────────────── */
+/* ── get_move_target ────────────────────────────────────────────────────── */
 
-static bool apply_move(GameState *gs, int idx, unsigned char dir) {
-    Player *p = &gs->players[idx];
-
-    if (dir >= DIRS) {
-        p->invalid_moves++;
-        return false;
-    }
-
+static bool get_move_target(const GameState *gs, int idx, unsigned char dir,
+                            int *nx_out, int *ny_out) {
+    const Player *p = &gs->players[idx];
+    if (dir >= DIRS) return false;
     int nx = (int)p->x + DX[dir];
     int ny = (int)p->y + DY[dir];
+    if (!is_cell_free(gs, nx, ny)) return false;
+    *nx_out = nx;
+    *ny_out = ny;
+    return true;
+}
 
-    if (!is_cell_free(gs, nx, ny)) {
-        p->invalid_moves++;
-        return false;
-    }
+/* ── execute_move ───────────────────────────────────────────────────────── */
 
+static void execute_move(GameState *gs, int idx, int nx, int ny) {
+    Player *p = &gs->players[idx];
     signed char reward = gs->board[ny * gs->width + nx];
     gs->board[ny * gs->width + nx] = (signed char)(-(idx + 1));
     p->score += (unsigned int)reward;
     p->x = (unsigned short)nx;
     p->y = (unsigned short)ny;
     p->valid_moves++;
-
     for (int i = 0; i < gs->player_count; i++)
         update_blocked(gs, i);
+}
 
+/* ── apply_move ─────────────────────────────────────────────────────────── */
+
+static bool apply_move(GameState *gs, int idx, unsigned char dir) {
+    Player *p = &gs->players[idx];
+    int nx, ny;
+    if (!get_move_target(gs, idx, dir, &nx, &ny)) {
+        p->invalid_moves++;
+        return false;
+    }
+    execute_move(gs, idx, nx, ny);
     return true;
 }
 
@@ -459,16 +491,14 @@ static int serve_round_robin(Master *m, bool *pipe_open, fd_set *read_fds,
     return last_served;
 }
 
-/* ── print_winner ───────────────────────────────────────────────────────── */
+/* ── find_winner_idx ────────────────────────────────────────────────────── */
 
-static void print_winner(const GameState *gs) {
+static int find_winner_idx(const GameState *gs, bool *empate_out) {
     int winner = 0;
     bool empate = false;
-
     for (int i = 1; i < (int)gs->player_count; i++) {
         const Player *w = &gs->players[winner];
         const Player *c = &gs->players[i];
-
         if (c->score > w->score) {
             winner = i; empate = false;
         } else if (c->score == w->score) {
@@ -483,7 +513,13 @@ static void print_winner(const GameState *gs) {
             }
         }
     }
+    *empate_out = empate;
+    return winner;
+}
 
+/* ── log_result ─────────────────────────────────────────────────────────── */
+
+static void log_result(const GameState *gs, int winner, bool empate) {
     if (empate) {
         fprintf(stderr, "empate\n");
     } else {
@@ -491,6 +527,14 @@ static void print_winner(const GameState *gs) {
         fprintf(stderr, "ganador: %s  score=%u  valid=%u  invalid=%u\n",
                 w->name, w->score, w->valid_moves, w->invalid_moves);
     }
+}
+
+/* ── print_winner ───────────────────────────────────────────────────────── */
+
+static void print_winner(const GameState *gs) {
+    bool empate;
+    int winner = find_winner_idx(gs, &empate);
+    log_result(gs, winner, empate);
 }
 
 /* ── finalize_game ──────────────────────────────────────────────────────── */

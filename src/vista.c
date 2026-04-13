@@ -64,17 +64,10 @@ static void die(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
-/* ── print_board ────────────────────────────────────────────────────────── */
+/* ── print_title ────────────────────────────────────────────────────────── */
 
-static void print_board(const GameState *gs) {
-    unsigned short w = gs->width;
-    unsigned short h = gs->height;
-
-    /* Ir a la esquina superior — sobreescribir sin borrar (sin parpadeo) */
-    printf(CURSOR_HOME);
-
-    /* ── Título ── */
-    if (gs->game_over) {
+static void print_title(bool game_over) {
+    if (game_over) {
         printf("  " C_TITLE BOLD "✦ ChompChamps ✦" RESET
                "  " C_GAME_OVER BOLD "[ JUEGO TERMINADO ]" RESET
                ERASE_EOL "\n\n");
@@ -83,83 +76,102 @@ static void print_board(const GameState *gs) {
                "  " DIM "[ en curso ]" RESET
                ERASE_EOL "\n\n");
     }
+}
 
-    /* ── Borde superior ── */
+/* ── print_top_border / print_bottom_border ─────────────────────────────── */
+
+static void print_top_border(int w) {
     printf("  " C_BORDER "┌");
-    for (int x = 0; x < (int)w; x++) printf("──");
+    for (int x = 0; x < w; x++) printf("──");
     printf("┐" RESET ERASE_EOL "\n");
+}
 
-    /* ── Filas del tablero ── */
-    for (unsigned short y = 0; y < h; y++) {
-        printf("  " C_BORDER "│" RESET);
-        for (unsigned short x = 0; x < w; x++) {
-            signed char cell = (signed char)gs->board[y * w + x];
-            if (cell > 0) {
-                /* Comida: gris claro uniforme */
-                printf(C_FOOD " %d" RESET, (int)cell);
-            } else if (cell == 0) {
-                /* Celda vacía: espacio en blanco */
-                printf("  ");
-            } else {
-                /* Territorio del jugador con índice = (-cell) - 1 */
-                int pidx = (-(int)cell) - 1;
-                if (pidx < 0 || pidx >= MAX_PLAYERS) pidx = 0;
-                char letter = 'A' + pidx;
-                bool is_head = (gs->players[pidx].x == x &&
-                                gs->players[pidx].y == y);
-                if (is_head) {
-                    /* Cabeza del jugador: letra mayúscula con subrayado */
-                    printf("%s" UNDERLINE " %c" RESET, P_COLOR[pidx % 9], letter);
-                } else {
-                    /* Territorio: puntito del color del jugador */
-                    printf("%s ●" RESET, P_COLOR[pidx % 9]);
-                }
-            }
+static void print_bottom_border(int w) {
+    printf("  " C_BORDER "└");
+    for (int x = 0; x < w; x++) printf("──");
+    printf("┘" RESET ERASE_EOL "\n\n");
+}
+
+/* ── print_cell ─────────────────────────────────────────────────────────── */
+
+static void print_cell(const GameState *gs, unsigned short x, unsigned short y) {
+    signed char cell = (signed char)gs->board[y * gs->width + x];
+    if (cell > 0) {
+        printf(C_FOOD " %d" RESET, (int)cell);
+    } else if (cell == 0) {
+        printf("  ");
+    } else {
+        int pidx = (-(int)cell) - 1;
+        if (pidx < 0 || pidx >= MAX_PLAYERS) pidx = 0;
+        char letter = 'A' + pidx;
+        bool is_head = (gs->players[pidx].x == x && gs->players[pidx].y == y);
+        if (is_head) {
+            printf("%s" UNDERLINE " %c" RESET, P_COLOR[pidx % 9], letter);
+        } else {
+            printf("%s ●" RESET, P_COLOR[pidx % 9]);
         }
+    }
+}
+
+/* ── print_board_rows ───────────────────────────────────────────────────── */
+
+static void print_board_rows(const GameState *gs) {
+    for (unsigned short y = 0; y < gs->height; y++) {
+        printf("  " C_BORDER "│" RESET);
+        for (unsigned short x = 0; x < gs->width; x++)
+            print_cell(gs, x, y);
         printf(C_BORDER "│" RESET ERASE_EOL "\n");
     }
+}
 
-    /* ── Borde inferior ── */
-    printf("  " C_BORDER "└");
-    for (int x = 0; x < (int)w; x++) printf("──");
-    printf("┘" RESET ERASE_EOL "\n\n");
+/* ── print_player_row ───────────────────────────────────────────────────── */
 
-    /* ── Tabla de estadísticas ── */
+static void print_player_row(const Player *p, int i) {
+    const char *col = P_COLOR[i % 9];
+    if (p->blocked) {
+        printf("  %s%-16s" RESET "  %6u  %7u    %7u  "
+               C_BLOCKED "[bloqueado]" RESET ERASE_EOL "\n",
+               col, p->name, p->score, p->valid_moves, p->invalid_moves);
+    } else {
+        printf("  %s%-16s" RESET "  %6u  %7u    %7u  (%u,%u)"
+               ERASE_EOL "\n",
+               col, p->name, p->score, p->valid_moves, p->invalid_moves,
+               p->x, p->y);
+    }
+}
+
+/* ── print_scoreboard ───────────────────────────────────────────────────── */
+
+static void print_scoreboard(const GameState *gs) {
     printf("  " C_HEADER BOLD
            "Jugador            Score  Válidos  Inválidos  Pos"
            RESET ERASE_EOL "\n");
     printf("  " C_BORDER
            "───────────────────────────────────────────────────"
            RESET ERASE_EOL "\n");
-
-    for (unsigned char i = 0; i < gs->player_count; i++) {
-        const Player *p = &gs->players[i];
-        const char *col = P_COLOR[i % 9];
-        if (p->blocked) {
-            printf("  %s%-16s" RESET "  %6u  %7u    %7u  "
-                   C_BLOCKED "[bloqueado]" RESET ERASE_EOL "\n",
-                   col, p->name,
-                   p->score, p->valid_moves, p->invalid_moves);
-        } else {
-            printf("  %s%-16s" RESET "  %6u  %7u    %7u  (%u,%u)"
-                   ERASE_EOL "\n",
-                   col, p->name,
-                   p->score, p->valid_moves, p->invalid_moves,
-                   p->x, p->y);
-        }
-    }
+    for (unsigned char i = 0; i < gs->player_count; i++)
+        print_player_row(&gs->players[i], (int)i);
     printf(ERASE_EOL "\n");
+}
+
+/* ── print_board ────────────────────────────────────────────────────────── */
+
+static void print_board(const GameState *gs) {
+    printf(CURSOR_HOME);
+    print_title(gs->game_over);
+    print_top_border(gs->width);
+    print_board_rows(gs);
+    print_bottom_border(gs->width);
+    print_scoreboard(gs);
     fflush(stdout);
 }
 
-/* ── print_game_over ────────────────────────────────────────────────────── */
+/* ── find_winner_idx ────────────────────────────────────────────────────── */
 
-static void print_game_over(const GameState *gs) {
-    int n = gs->player_count;
-
-    /* Encontrar ganador */
+static int find_winner_idx(const GameState *gs, bool *empate_out) {
     int winner = 0;
     bool empate = false;
+    int n = gs->player_count;
     for (int i = 1; i < n; i++) {
         const Player *w = &gs->players[winner];
         const Player *c = &gs->players[i];
@@ -169,52 +181,66 @@ static void print_game_over(const GameState *gs) {
             else if (c->valid_moves == w->valid_moves) empate = true;
         }
     }
+    *empate_out = empate;
+    return winner;
+}
 
-    /* Ordenar índices por score descendente */
-    int order[MAX_PLAYERS];
+/* ── sort_by_score ──────────────────────────────────────────────────────── */
+
+static void sort_by_score(const GameState *gs, int *order) {
+    int n = gs->player_count;
     for (int i = 0; i < n; i++) order[i] = i;
     for (int i = 0; i < n - 1; i++)
         for (int j = i + 1; j < n; j++)
             if (gs->players[order[j]].score > gs->players[order[i]].score) {
                 int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
             }
+}
 
-    int box_w = 52;
+/* ── print_centered_box_line ────────────────────────────────────────────── */
 
-    /* Imprime línea centrada en el cuadro */
-    #define CBOX(txt, vlen) do { \
-        printf("  " C_BORDER "║" RESET); \
-        int _p = (box_w - (vlen)) / 2, _p2 = box_w - (vlen) - _p; \
-        for(int _i=0;_i<_p;_i++) putchar(' '); \
-        printf("%s", txt); \
-        for(int _i=0;_i<_p2;_i++) putchar(' '); \
-        printf(C_BORDER "║" RESET ERASE_EOL "\n"); \
-    } while(0)
+static void print_centered_box_line(const char *txt, int vlen, int box_w) {
+    printf("  " C_BORDER "║" RESET);
+    int pad_l = (box_w - vlen) / 2;
+    int pad_r = box_w - vlen - pad_l;
+    for (int i = 0; i < pad_l; i++) putchar(' ');
+    printf("%s", txt);
+    for (int i = 0; i < pad_r; i++) putchar(' ');
+    printf(C_BORDER "║" RESET ERASE_EOL "\n");
+}
 
+/* ── print_game_over_header ─────────────────────────────────────────────── */
+
+static void print_game_over_header(const GameState *gs, int winner,
+                                   bool empate, int box_w) {
     printf("\n");
     printf("  " C_BORDER "╔════════════════════════════════════════════════════╗" RESET ERASE_EOL "\n");
-    CBOX(C_TITLE BOLD "★  JUEGO TERMINADO  ★" RESET, 21);
-
+    print_centered_box_line(C_TITLE BOLD "★  JUEGO TERMINADO  ★" RESET, 21, box_w);
     if (empate) {
-        CBOX(C_GAME_OVER BOLD "¡EMPATE!" RESET, 8);
+        print_centered_box_line(C_GAME_OVER BOLD "¡EMPATE!" RESET, 8, box_w);
     } else {
         const Player *wp = &gs->players[winner];
         const char   *wc = P_COLOR[winner % 9];
         char line[80];
         snprintf(line, sizeof(line), BOLD "%sGanador: %s" RESET, wc, wp->name);
         int vlen = 9 + (int)strlen(wp->name);
-        CBOX(line, vlen);
+        print_centered_box_line(line, vlen, box_w);
     }
+}
 
+/* ── print_game_over_results ────────────────────────────────────────────── */
+
+static void print_game_over_results(const GameState *gs, const int *order,
+                                    int winner, bool empate) {
+    int n = gs->player_count;
     printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
     printf("  " C_BORDER "║" RESET C_HEADER BOLD
            "  #  Jugador            Score  Validos  Invalidos   "
            RESET C_BORDER "║" RESET ERASE_EOL "\n");
     printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
-
     for (int r = 0; r < n; r++) {
         int idx = order[r];
-        const Player *p  = &gs->players[idx];
+        const Player *p   = &gs->players[idx];
         const char   *col = P_COLOR[idx % 9];
         const char   *medal = (idx == winner && !empate) ? "\033[1;33m★ " RESET : "  ";
         printf("  " C_BORDER "║" RESET
@@ -223,12 +249,21 @@ static void print_game_over(const GameState *gs) {
                medal, r + 1, col, p->name,
                p->score, p->valid_moves, p->invalid_moves);
     }
+}
 
+/* ── print_game_over ────────────────────────────────────────────────────── */
+
+static void print_game_over(const GameState *gs) {
+    int box_w = 52;
+    bool empate;
+    int winner = find_winner_idx(gs, &empate);
+    int order[MAX_PLAYERS];
+    sort_by_score(gs, order);
+    print_game_over_header(gs, winner, empate, box_w);
+    print_game_over_results(gs, order, winner, empate);
     printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
-    CBOX(DIM "Presioná Ctrl+C para salir" RESET, 26);
+    print_centered_box_line(DIM "Presioná Ctrl+C para salir" RESET, 26, box_w);
     printf("  " C_BORDER "╚════════════════════════════════════════════════════╝" RESET ERASE_EOL "\n\n");
-
-    #undef CBOX
     fflush(stdout);
 }
 
