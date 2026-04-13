@@ -152,6 +152,86 @@ static void print_board(const GameState *gs) {
     fflush(stdout);
 }
 
+/* ── print_game_over ────────────────────────────────────────────────────── */
+
+static void print_game_over(const GameState *gs) {
+    int n = gs->player_count;
+
+    /* Encontrar ganador */
+    int winner = 0;
+    bool empate = false;
+    for (int i = 1; i < n; i++) {
+        const Player *w = &gs->players[winner];
+        const Player *c = &gs->players[i];
+        if (c->score > w->score) { winner = i; empate = false; }
+        else if (c->score == w->score) {
+            if (c->valid_moves < w->valid_moves) { winner = i; empate = false; }
+            else if (c->valid_moves == w->valid_moves) empate = true;
+        }
+    }
+
+    /* Ordenar índices por score descendente */
+    int order[MAX_PLAYERS];
+    for (int i = 0; i < n; i++) order[i] = i;
+    for (int i = 0; i < n - 1; i++)
+        for (int j = i + 1; j < n; j++)
+            if (gs->players[order[j]].score > gs->players[order[i]].score) {
+                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+
+    int box_w = 52;
+
+    /* Imprime línea centrada en el cuadro */
+    #define CBOX(txt, vlen) do { \
+        printf("  " C_BORDER "║" RESET); \
+        int _p = (box_w - (vlen)) / 2, _p2 = box_w - (vlen) - _p; \
+        for(int _i=0;_i<_p;_i++) putchar(' '); \
+        printf("%s", txt); \
+        for(int _i=0;_i<_p2;_i++) putchar(' '); \
+        printf(C_BORDER "║" RESET ERASE_EOL "\n"); \
+    } while(0)
+
+    printf("\n");
+    printf("  " C_BORDER "╔════════════════════════════════════════════════════╗" RESET ERASE_EOL "\n");
+    CBOX(C_TITLE BOLD "★  JUEGO TERMINADO  ★" RESET, 21);
+
+    if (empate) {
+        CBOX(C_GAME_OVER BOLD "¡EMPATE!" RESET, 8);
+    } else {
+        const Player *wp = &gs->players[winner];
+        const char   *wc = P_COLOR[winner % 9];
+        char line[80];
+        snprintf(line, sizeof(line), BOLD "%sGanador: %s" RESET, wc, wp->name);
+        int vlen = 9 + (int)strlen(wp->name);
+        CBOX(line, vlen);
+    }
+
+    printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
+    printf("  " C_BORDER "║" RESET C_HEADER BOLD
+           "  #  Jugador            Score  Validos  Invalidos   "
+           RESET C_BORDER "║" RESET ERASE_EOL "\n");
+    printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
+
+    for (int r = 0; r < n; r++) {
+        int idx = order[r];
+        const Player *p  = &gs->players[idx];
+        const char   *col = P_COLOR[idx % 9];
+        const char   *medal = (idx == winner && !empate) ? "\033[1;33m★ " RESET : "  ";
+        printf("  " C_BORDER "║" RESET
+               " %s%2d  %s%-16s" RESET "  %6u   %6u    %6u  "
+               C_BORDER "║" RESET ERASE_EOL "\n",
+               medal, r + 1, col, p->name,
+               p->score, p->valid_moves, p->invalid_moves);
+    }
+
+    printf("  " C_BORDER "╠════════════════════════════════════════════════════╣" RESET ERASE_EOL "\n");
+    CBOX(DIM "Presioná Ctrl+C para salir" RESET, 26);
+    printf("  " C_BORDER "╚════════════════════════════════════════════════════╝" RESET ERASE_EOL "\n\n");
+
+    #undef CBOX
+    fflush(stdout);
+}
+
 /* ── map_game_state ─────────────────────────────────────────────────────── */
 
 static GameState *map_game_state(unsigned short width, unsigned short height) {
@@ -190,6 +270,12 @@ static void view_loop(const GameState *gs, GameSync *sync) {
         if (sem_post(&sync->view_done) == -1) die("sem_post view_done");
         if (over) break;
     }
+
+    /* Pantalla final con cuadro estilizado — no redibujar el tablero */
+    print_game_over(gs);
+
+    /* Esperar Ctrl+C */
+    while (1) pause();
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
