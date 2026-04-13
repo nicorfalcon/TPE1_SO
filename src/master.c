@@ -143,7 +143,7 @@ static void initGame(Master *m) {
     srand(m->seed);
     int total = m->width * m->height;
     for (int i = 0; i < total; i++)
-        m->gs->board[i] = (char)(rand() % 9 + 1);
+        m->gs->board[i] = (signed char)(rand() % 9 + 1);
 
     int fdSync = shm_open(SHM_SYNC_NAME, O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fdSync == -1) die("shm_open /game_sync");
@@ -254,7 +254,7 @@ static void initPlayers(Master *m) {
         gs->players[i].blocked       = false;
         gs->players[i].pid           = m->player_pids[i];
         snprintf(gs->players[i].name, sizeof(gs->players[i].name), "player_%d", i);
-        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (char)(-i);
+        *board_cell(gs, (unsigned short)x, (unsigned short)y) = (signed char)(-(i + 1));
     }
 }
 
@@ -319,8 +319,8 @@ static bool apply_move(GameState *gs, int idx, unsigned char dir) {
         return false;
     }
 
-    char reward = gs->board[ny * gs->width + nx];
-    gs->board[ny * gs->width + nx] = (char)(-idx);
+    signed char reward = gs->board[ny * gs->width + nx];
+    gs->board[ny * gs->width + nx] = (signed char)(-(idx + 1));
     p->score += (unsigned int)reward;
     p->x = (unsigned short)nx;
     p->y = (unsigned short)ny;

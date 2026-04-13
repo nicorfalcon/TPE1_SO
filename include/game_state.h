@@ -24,17 +24,16 @@ typedef struct {
     unsigned char player_count;  // Cantidad de jugadores activos
     Player players[MAX_PLAYERS]; // Lista de jugadores
     bool game_over;              // true cuando el juego terminó
-    char board[];                // Tablero: width * height chars (flexible array)
+    signed char board[];         // Tablero: width * height chars (flexible array)
 } GameState;
 
 static inline size_t game_state_size(unsigned short w, unsigned short h) {
-    return sizeof(GameState) + (size_t)w * h * sizeof(char);
+    return sizeof(GameState) + (size_t)w * h * sizeof(signed char);
 }
  
 /* Acceso a una celda del tablero */
-static inline char *board_cell(GameState *gs, unsigned short x, unsigned short y) {
+static inline signed char *board_cell(GameState *gs, unsigned short x, unsigned short y) {
     return &gs->board[y * gs->width + x];
 }
  
 #endif /* GAME_STATE_H */
- 

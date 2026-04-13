@@ -93,23 +93,26 @@ static void print_board(const GameState *gs) {
     for (unsigned short y = 0; y < h; y++) {
         printf("  " C_BORDER "│" RESET);
         for (unsigned short x = 0; x < w; x++) {
-            char cell = gs->board[y * w + x];
+            signed char cell = (signed char)gs->board[y * w + x];
             if (cell > 0) {
                 /* Comida: gris claro uniforme */
                 printf(C_FOOD " %d" RESET, (int)cell);
+            } else if (cell == 0) {
+                /* Celda vacía: espacio en blanco */
+                printf("  ");
             } else {
-                /* Territorio del jugador con índice = -cell */
-                int pidx = -(int)cell;
+                /* Territorio del jugador con índice = (-cell) - 1 */
+                int pidx = (-(int)cell) - 1;
                 if (pidx < 0 || pidx >= MAX_PLAYERS) pidx = 0;
                 char letter = 'A' + pidx;
                 bool is_head = (gs->players[pidx].x == x &&
                                 gs->players[pidx].y == y);
                 if (is_head) {
-                    /* Cabeza del jugador: letra con subrayado */
+                    /* Cabeza del jugador: letra mayúscula con subrayado */
                     printf("%s" UNDERLINE " %c" RESET, P_COLOR[pidx % 9], letter);
                 } else {
-                    /* Territorio: letra del jugador en color llamativo */
-                    printf("%s %c" RESET, P_COLOR[pidx % 9], letter);
+                    /* Territorio: puntito del color del jugador */
+                    printf("%s ●" RESET, P_COLOR[pidx % 9]);
                 }
             }
         }

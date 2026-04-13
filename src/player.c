@@ -57,7 +57,7 @@ static int find_my_index(const GameState *gs) {
 
 /* ── flood_push_neighbors ───────────────────────────────────────────────── */
 
-static void flood_push_neighbors(const char *board_copy, int w, int h,
+static void flood_push_neighbors(const signed char *board_copy, int w, int h,
                                  Cell c, uint8_t *visited, Cell *stack, int *top) {
     for (int d = 0; d < DIRS; d++) {
         int nx = c.x + DX[d], ny = c.y + DY[d];
@@ -72,7 +72,7 @@ static void flood_push_neighbors(const char *board_copy, int w, int h,
 /* ── flood_fill ─────────────────────────────────────────────────────────── */
 
 static int flood_fill(const GameState *gs, unsigned short sx, unsigned short sy,
-                      const char *board_copy) {
+                      const signed char *board_copy) {
     int w = gs->width, h = gs->height, total = w * h;
     uint8_t *visited = calloc((size_t)total, 1);
     Cell    *stack   = malloc((size_t)total * sizeof(Cell));
@@ -92,15 +92,15 @@ static int flood_fill(const GameState *gs, unsigned short sx, unsigned short sy,
 
 /* ── eval_direction ─────────────────────────────────────────────────────── */
 
-static void eval_direction(const GameState *gs, int player_idx, char *board_copy,
+static void eval_direction(const GameState *gs, int player_idx, signed char *board_copy,
                            int d, int *best_dir, int *best_flood, int *best_reward) {
     const Player *me = &gs->players[player_idx];
     int w = gs->width, h = gs->height;
     int nx = (int)me->x + DX[d], ny = (int)me->y + DY[d];
     if (nx < 0 || nx >= w || ny < 0 || ny >= h) return;
-    char cell = board_copy[ny * w + nx];
+    signed char cell = board_copy[ny * w + nx];
     if (cell <= 0) return;
-    board_copy[ny * w + nx] = (char)(-player_idx);
+    board_copy[ny * w + nx] = (signed char)(-(player_idx + 1));
     int flood  = flood_fill(gs, (unsigned short)nx, (unsigned short)ny, board_copy);
     int reward = (int)cell;
     board_copy[ny * w + nx] = cell;
@@ -115,7 +115,7 @@ static void eval_direction(const GameState *gs, int player_idx, char *board_copy
 
 static unsigned char elegir_movimiento(const GameState *gs, int player_idx) {
     int total = gs->width * gs->height;
-    char *board_copy = malloc((size_t)total);
+    signed char *board_copy = malloc((size_t)total);
     if (!board_copy) return 0;
     memcpy(board_copy, gs->board, (size_t)total);
     int best_dir = -1, best_flood = -1, best_reward = -1;
