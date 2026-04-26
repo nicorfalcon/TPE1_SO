@@ -9,6 +9,7 @@
 #include <semaphore.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "game_state.h"
 #include "game_sync.h"
@@ -90,10 +91,24 @@ static int flood_fill(const GameState *gs, unsigned short sx, unsigned short sy,
     return count;
 }
 
+/* ── min_dist_to_opponents ──────────────────────────────────────────────── */
+
+static int min_dist_to_opponents(const GameState *gs, int my_idx, int nx, int ny) {
+    int min_dist = INT_MAX;
+    for (int i = 0; i < gs->player_count; i++) {
+        if (i == my_idx || gs->players[i].blocked) continue;
+        int dx = (int)gs->players[i].x - nx; if (dx < 0) dx = -dx;
+        int dy = (int)gs->players[i].y - ny; if (dy < 0) dy = -dy;
+        int dist = dx > dy ? dx : dy;
+        if (dist < min_dist) min_dist = dist;
+    }
+    return min_dist;
+}
+
 /* ── eval_direction ─────────────────────────────────────────────────────── */
 
 static void eval_direction(const GameState *gs, int player_idx, signed char *board_copy,
-                           int d, int *best_dir, int *best_flood, int *best_reward) {
+                           int d, int *best_dir, int *best_flood, int *best_reward, int *best_dist) {
     const Player *me = &gs->players[player_idx];
     int w = gs->width, h = gs->height;
     int nx = (int)me->x + DX[d], ny = (int)me->y + DY[d];
@@ -104,9 +119,13 @@ static void eval_direction(const GameState *gs, int player_idx, signed char *boa
     int flood  = flood_fill(gs, (unsigned short)nx, (unsigned short)ny, board_copy);
     int reward = (int)cell;
     board_copy[ny * w + nx] = cell;
-    if (flood > *best_flood || (flood == *best_flood && reward > *best_reward)) {
+    int dist = min_dist_to_opponents(gs, player_idx, nx, ny);
+    if (flood > *best_flood ||
+        (flood == *best_flood && dist < *best_dist) ||
+        (flood == *best_flood && dist == *best_dist && reward > *best_reward)) {
         *best_flood  = flood;
         *best_reward = reward;
+        *best_dist   = dist;
         *best_dir    = d;
     }
 }
@@ -118,10 +137,10 @@ static unsigned char elegir_movimiento(const GameState *gs, int player_idx) {
     signed char *board_copy = malloc((size_t)total);
     if (!board_copy) return 0;
     memcpy(board_copy, gs->board, (size_t)total);
-    int best_dir = -1, best_flood = -1, best_reward = -1;
+    int best_dir = -1, best_flood = -1, best_reward = -1, best_dist = INT_MAX;
     for (int d = 0; d < DIRS; d++)
         eval_direction(gs, player_idx, board_copy, d,
-                       &best_dir, &best_flood, &best_reward);
+                       &best_dir, &best_flood, &best_reward, &best_dist);
     free(board_copy);
     return (unsigned char)(best_dir >= 0 ? best_dir : 0);
 }
